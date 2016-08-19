@@ -295,19 +295,19 @@ module Resque
     # USR2: Don't process any new jobs
     # CONT: Start processing jobs again after a USR2
     def register_signal_handlers
-      st = Resque::SignalTrap.new
-      st.trap('TERM') { graceful_term ? shutdown : shutdown!  }
-      st.trap('INT')  { shutdown!  }
+      sh = @signal_handler = Resque::SignalHandler.new
+      sh.trap('TERM') { graceful_term ? shutdown : shutdown!  }
+      sh.trap('INT')  { shutdown!  }
 
       begin
-        st.trap('QUIT') { shutdown   }
+        sh.trap('QUIT') { shutdown   }
         if term_child
-          st.trap('USR1') { new_kill_child }
+          sh.trap('USR1') { new_kill_child }
         else
-          st.trap('USR1') { kill_child }
+          sh.trap('USR1') { kill_child }
         end
-        st.trap('USR2') { pause_processing }
-        st.trap('CONT') { unpause_processing }
+        sh.trap('USR2') { pause_processing }
+        sh.trap('CONT') { unpause_processing }
       rescue ArgumentError
         warn "Signals QUIT, USR1, USR2, and/or CONT not supported."
       end
@@ -663,6 +663,44 @@ module Resque
       Kernel.warn "Called from: #{caller[0..5].join("\n\t")}"
       $warned_logger_severity_deprecation = true
       nil
+    end
+
+    private
+
+    def perform_with_fork(job, &block)
+      run_hook :before_fork, job
+
+      begin
+        @child = fork do
+          if term_child
+            unregister_signal_handlers
+          else
+            @signal_handler.reopen
+          end
+          perform(job, &block)
+          exit! unless run_at_exit_hooks
+        end
+      rescue NotImplementedError
+        @fork_per_job = false
+        perform(job, &block)
+        return
+      end
+
+      srand # Reseeding
+      procline "Forked #{@child} at #{Time.now.to_i}"
+
+      begin
+        Process.waitpid(@child)
+      rescue SystemCallError
+        nil
+      end
+
+      job.fail(DirtyExit.new("Child process received unhandled signal #{$?.stopsig}")) if $?.signaled?
+      @child = nil
+    end
+
+    def log_with_severity(severity, message)
+      Logging.log(severity, message)
     end
   end
 end
